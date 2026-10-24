@@ -1,0 +1,11 @@
+{
+  "name": "Taro Example",
+  "headline": "Software Engineer",
+  "bio": "This is example profile content. Replace it with your own in profile.json.",
+  "links": [
+    {
+      "label": "GitHub",
+      "url": "https://github.com/example"
+    }
+  ]
+}
