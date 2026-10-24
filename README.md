@@ -44,6 +44,24 @@ curl http://localhost:8000/api/health
 # {"status":"ok"}
 ```
 
+お問い合わせ API (現時点では保存・通知は行わず、受信内容を構造化ログへ出力するのみ):
+
+```sh
+curl -X POST http://localhost:8000/api/contact \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Example User","email":"user@example.com","message":"Hello"}'
+# {"status":"accepted"}  (HTTP 202)
+```
+
+| フィールド | 制約 |
+| --- | --- |
+| `name` | 必須、1〜100 文字 (前後の空白は除去) |
+| `email` | 必須、メールアドレス形式、最大 254 文字 |
+| `message` | 必須、1〜5000 文字 |
+| `website` | 任意。honeypot 用 (フォームでは非表示にする)。値があれば受理したように見せて破棄 |
+
+不正なリクエストや未知のフィールドには `422` を返します。
+
 ### 3. Frontend (http://localhost:5173)
 
 別のターミナルで:
