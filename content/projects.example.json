@@ -1,0 +1,8 @@
+[
+  {
+    "title": "Example Project",
+    "description": "This is an example project entry. Replace it with your own in projects.json.",
+    "technologies": ["React", "TypeScript", "FastAPI"],
+    "url": "https://example.com"
+  }
+]
