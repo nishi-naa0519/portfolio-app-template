@@ -7,3 +7,12 @@ body {
   margin: 0;
   padding: 2rem;
 }
+
+/* Contact form honeypot: kept in the DOM for bots but out of view for people. */
+.honeypot {
+  position: absolute;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}

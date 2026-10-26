@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { fetchHealth } from './api/health'
+import ContactForm from './components/ContactForm'
 
 type BackendStatus = 'checking' | 'ok' | 'unavailable'
 
@@ -24,6 +25,10 @@ function App() {
       <p>
         Backend status: <span data-testid="backend-status">{backendStatus}</span>
       </p>
+      <section aria-labelledby="contact-heading">
+        <h2 id="contact-heading">Contact</h2>
+        <ContactForm />
+      </section>
     </main>
   )
 }

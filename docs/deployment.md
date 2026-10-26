@@ -16,8 +16,9 @@
    ├─ Artifact Registry  portfolio (Docker, <REGION>)   … コンテナイメージ
    ├─ Cloud Run          portfolio (<REGION>)           … FastAPI + ビルド済み frontend
    │    └─ 実行 SA       portfolio-runtime
-   ├─ Firestore          (default) (Native, <REGION>)   … Issue #4 以降で使用
-   ├─ Secret Manager                                     … Issue #4 以降で使用
+   ├─ Firestore          (default) (Native, <REGION>)   … 問い合わせと rate limit の保存
+   ├─ Secret Manager                                     … Gmail の認証情報と IP ハッシュ用の鍵
+   ├─ OAuth クライアント (デスクトップ アプリ)            … Gmail API での通知メール送信
    └─ deploy 用 SA       portfolio-deployer              … 手元から impersonation で使う
 
 請求先アカウント
@@ -178,8 +179,8 @@ gcloud services enable `
 | `run` | Cloud Run |
 | `artifactregistry` | コンテナイメージの保存 |
 | `firestore` | Firestore (App Engine は不要) |
-| `secretmanager` | 秘密情報の保存 (Issue #4 以降) |
-| `gmail` | 問い合わせ通知 (Issue #4 以降)。有効化のみ |
+| `secretmanager` | 秘密情報の保存 (11. を参照) |
+| `gmail` | 問い合わせの通知メール (11. を参照) |
 | `iam` | Service Account の作成 |
 | `iamcredentials` | Service Account の impersonation (短命トークンの発行) |
 
@@ -226,7 +227,8 @@ gcloud での作成コマンドは文書化されていません (Console か Cl
 
 | principal | role | resource | 理由 |
 | --- | --- | --- | --- |
-| `portfolio-runtime` | (なし) | — | 現時点のアプリは GCP API を呼ばない。Issue #4 で Firestore と Secret Manager に必要な権限だけを追加する |
+| `portfolio-runtime` | Cloud Datastore ユーザー (`roles/datastore.user`) | プロジェクト | 問い合わせと rate limit を Firestore に読み書きするため (11-e で付与) |
+| `portfolio-runtime` | Secret Manager のシークレット アクセサー (`roles/secretmanager.secretAccessor`) | **お問い合わせ用の 3 つの secret のみ** | 実行時に secret を読むため (11-e で付与) |
 | `portfolio-deployer` | Cloud Run デベロッパー (`roles/run.developer`) | プロジェクト | 初回 deploy でサービスを作成し、以降は更新するため |
 | `portfolio-deployer` | サービス アカウント ユーザー (`roles/iam.serviceAccountUser`) | **`portfolio-runtime` のみ** | Cloud Run に実行 SA を割り当てるため |
 | `portfolio-deployer` | Artifact Registry 書き込み (`roles/artifactregistry.writer`) | **repository `portfolio` のみ** (7. で付与) | イメージを push するため |
@@ -323,6 +325,12 @@ gcloud run deploy portfolio `
   --impersonate-service-account=$DEPLOYER
 ```
 
+お問い合わせ機能を使う場合は、先に 10. と 11. の準備を済ませ、上のコマンドに次の環境変数を加えます (11-f を参照)。
+
+```powershell
+  --update-env-vars="CONTACT_NOTIFY_TO=$NOTIFY_TO,GMAIL_OAUTH_CLIENT_ID=$CLIENT_ID,GMAIL_OAUTH_CLIENT_SECRET_SECRET_VERSION=projects/$P/secrets/gmail-oauth-client-secret/versions/latest,GMAIL_REFRESH_TOKEN_SECRET_VERSION=projects/$P/secrets/gmail-refresh-token/versions/latest,CONTACT_IP_HASH_KEY_SECRET_VERSION=projects/$P/secrets/contact-ip-hash-key/versions/latest"
+```
+
 - 初回に `Allow unauthenticated invocations to [portfolio] (y/N)?` と聞かれたら、`N` と答えてください。deployer には公開設定の権限がないためです。公開設定は 8-c で行います。
 - 2回目以降の deploy も、同じコマンドで行います。
 
@@ -391,7 +399,7 @@ Console では、「Cloud Run > portfolio」の「スケーリング」タブ (�
 
 ## 10. Firestore
 
-Issue #4 で、問い合わせの保存に使います。ここでは作成までを行います。
+問い合わせの保存と、問い合わせ API の rate limit に使います。
 
 | 項目 | 値 | |
 | --- | --- | --- |
@@ -417,13 +425,175 @@ gcloud firestore databases describe --database="(default)" --project=$P
 - Console で作成すると、削除保護が無効のまま作られることがあります。その場合は `gcloud firestore databases update --database="(default)" --delete-protection --project=$P` で有効にします。
 - 無料枠: 保存容量 1 GiB、読み取り 5万/日、書き込み 2万/日、削除 2万/日、外向き通信 10 GiB/月。TTL による削除は無料枠の対象外です。([pricing](https://docs.cloud.google.com/firestore/pricing))
 
-## 11. Secret Manager
+**アプリが使うコレクション**
 
-API を有効にするだけで、現時点では secret を作りません (Issue #4 以降で作成します)。
-`gcloud secrets list --project=$P` がエラーなく実行できれば、利用できる状態です。
+| コレクション | 内容 | 削除 |
+| --- | --- | --- |
+| `contacts` | 問い合わせ (`name`・`email`・`message`・`created_at`・`status`)。IP アドレスは保存しない | 自動では削除しない |
+| `contact_rate_limits` | rate limit のカウンタ (`count`・`expire_at`)。ドキュメント ID に IP の HMAC ハッシュと時間枠を含む | `expire_at` を TTL で削除 |
 
-- 無料枠: 有効な secret バージョン 6個、アクセス 1万回/月 (請求先アカウント単位)。([pricing](https://docs.cloud.google.com/secret-manager/pricing))
-- 実行 SA には、Secret Accessor (`roles/secretmanager.secretAccessor`) を**必要な secret に対してだけ**付与します。
+1 件の問い合わせを受理するときの操作は、読み取り 3 件・書き込み 4 件 (1 つのトランザクション) です。
+rate limit を超えたリクエストは読み取り 3 件だけで、書き込みはしません。
+書き込みはサイト全体の上限 (既定 20 件/日) で抑えられるため、TTL による削除も 1 日あたり数十件以下です (TTL の削除料金は 10 万件あたり $0.01 前後。2026-10 時点の us-central1)。
+
+**TTL ポリシー** (rate limit 用のデータを無期限に溜めないため。プロジェクトのオーナーが実行)
+
+```powershell
+gcloud firestore fields ttls update expire_at --project=$P `
+  --collection-group=contact_rate_limits --enable-ttl
+
+gcloud firestore fields ttls list --project=$P   # state: ACTIVE になれば OK (10 分以上かかることがある)
+```
+
+- TTL による削除は、通常は期限切れから 24 時間以内に行われます。期限切れのデータが残っていても、時間枠ごとに別のドキュメントを使うので rate limit の判定には影響しません。([ttl](https://docs.cloud.google.com/firestore/docs/ttl))
+- Console では「Firestore > (default) > TTL」から、コレクション グループ `contact_rate_limits`、フィールド `expire_at` で作成します。
+
+## 11. お問い合わせ機能 (Firestore・Gmail・Secret Manager)
+
+```text
+ブラウザ → Cloud Run (FastAPI) ─┬→ Firestore: rate limit の確認と問い合わせの保存 (1 トランザクション)
+                                ├→ Secret Manager: 認証情報の読み取り (インスタンスごとに初回の問い合わせ時だけ)
+                                └→ Gmail API: 通知メールの送信 (保存に成功した問い合わせだけ)
+```
+
+- 通知は、OAuth で許可した Gmail アカウントから `CONTACT_NOTIFY_TO` 宛てに送ります。From はそのアカウントになり、Reply-To は問い合わせした人のアドレスです。
+- 通知先のアドレスは API の応答に含めません。
+- Google Cloud のクライアント ライブラリと secret は、最初の問い合わせのときに読み込みます。ページを閲覧するだけでは、Firestore・Secret Manager・Gmail API へのアクセスは発生しません。
+
+### 11-a. OAuth 同意画面 (Console のみ)
+
+個人の Gmail アカウントから Gmail API でメールを送るには、OAuth 2.0 の refresh token を使います (Workspace のドメイン全体の委任は、個人の Gmail では使えません)。
+
+「**Google Auth Platform**」(旧「API とサービス > OAuth 同意画面」) で設定します。
+
+| 項目 | 値 | |
+| --- | --- | --- |
+| アプリ名 | 任意 (例: `portfolio-contact`)。認可の画面に表示される | 🔁 |
+| ユーザー サポートメール / デベロッパーの連絡先 | 自分のメールアドレス | 🔁 |
+| 対象 (User type) | **外部** (個人の Gmail アカウントは、組織の「内部」ユーザーではないため) | ⚠️ |
+| 公開ステータス | **本番環境 (In production)** | 🔁 |
+
+> [!IMPORTANT]
+> 公開ステータスが「**テスト中**」のままだと、テストユーザーの認可は **7 日で失効し、refresh token も失効**します (通知が止まります)。
+> 「対象」の画面で「**アプリを公開**」を押し、本番環境にしてください。
+> `gmail.send` は「機密性の高いスコープ」なので、確認 (verification) を受けていないアプリでは、認可するときに「Google はこのアプリを確認していません」と表示されます。
+> 自分のアカウントで使うだけなら、「詳細」→「(アプリ名) に移動」で進めます。未確認のアプリを認可できるユーザーは、合計 100 人までに制限されます。
+> ([Manage App Audience](https://support.google.com/cloud/answer/15549945)、[OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)、[Gmail API のスコープ](https://developers.google.com/workspace/gmail/api/auth/scopes))
+
+refresh token は、ほかにも次の場合に失効します。失効したら 11-c をやり直して、secret に新しいバージョンを追加します。
+- 6 か月間使われなかったとき
+- アカウントのパスワードを変更したとき (Gmail のスコープを含むため)
+- 同じクライアントで 100 個を超える refresh token を発行したとき (古いものから無効になる)
+- アカウントの「サードパーティ製のアプリとサービス」から、アクセス権を削除したとき
+
+### 11-b. OAuth クライアントを作成する (Console のみ)
+
+「Google Auth Platform > クライアント > クライアントを作成」で作成します。
+
+| 項目 | 値 | |
+| --- | --- | --- |
+| アプリケーションの種類 | **デスクトップ アプリ** (11-c のスクリプトが、ローカルの一時的なポートで認可コードを受け取るため) | 🔒 |
+| 名前 | 任意 (例: `portfolio-gmail-sender`) | 🔁 |
+
+作成後に表示されるクライアント ID とクライアント シークレットを控えます。
+JSON をダウンロードした場合は、リポジトリの外に置いてください (`client_secret*.json` は `.gitignore` 済みです)。
+
+### 11-c. refresh token を取得する
+
+通知メールを**送信する** Gmail アカウントでログインし、`gmail.send` (メールの送信のみ) を許可します。
+
+```powershell
+cd backend
+$env:GMAIL_OAUTH_CLIENT_ID = "<CLIENT_ID>"
+# クライアント シークレットは、環境変数で渡さなければ入力を求められます (画面には表示されません)
+uv run --with google-auth-oauthlib python scripts/get_gmail_refresh_token.py |
+  gcloud secrets create gmail-refresh-token --project=$P --replication-policy=automatic --data-file=-
+cd ..
+```
+
+- ブラウザが開きます。送信に使う Gmail アカウントを選び、未確認アプリの警告 (11-a) を進めて許可します。
+- スクリプトは refresh token だけを標準出力に書きます。上のようにパイプで secret に直接保存すれば、画面やファイルに残りません。
+- `google-auth-oauthlib` は `--with` で一時的に使うだけで、アプリの依存関係には含めません。
+- 2 回目以降 (secret が既にある場合) は、`gcloud secrets create ... --replication-policy=automatic` の代わりに `gcloud secrets versions add gmail-refresh-token --project=$P --data-file=-` を使います。
+
+### 11-d. Secret Manager に secret を作成する
+
+| secret ID | 内容 | |
+| --- | --- | --- |
+| `gmail-refresh-token` | 11-c で取得した refresh token | 🔒 ID は変更できない |
+| `gmail-oauth-client-secret` | 11-b のクライアント シークレット | 🔒 |
+| `contact-ip-hash-key` | IP アドレスをハッシュにするための鍵 (ランダムな文字列) | 🔒 |
+
+- レプリケーションは **automatic** にします (🔒 作成後に変更できません。料金は 1 ロケーション分として計算されます)。
+- クライアント ID は秘密情報ではないため、secret にせず環境変数で渡します。
+- 無料枠は、有効な secret バージョン 6 個、アクセス 1 万回/月です (請求先アカウント単位)。アプリは、インスタンスごとに最初の問い合わせのときだけ 3 つの secret を読み、メモリに保持します。([pricing](https://cloud.google.com/secret-manager/pricing))
+- 無効にしただけのバージョンも「有効なバージョン」として数えられます。不要になった古いバージョンは `gcloud secrets versions destroy` で破棄してください。
+
+```powershell
+# クライアント シークレット (貼り付けて Enter。画面には表示されない)
+Read-Host -AsSecureString "client secret" | ConvertFrom-SecureString -AsPlainText |
+  gcloud secrets create gmail-oauth-client-secret --project=$P --replication-policy=automatic --data-file=-
+
+# IP ハッシュ用の鍵 (32 バイトの乱数を 16 進数にしたもの)
+python -c "import secrets; print(secrets.token_hex(32))" |
+  gcloud secrets create contact-ip-hash-key --project=$P --replication-policy=automatic --data-file=-
+
+gcloud secrets list --project=$P
+```
+
+- パイプで渡すと末尾に改行が付くことがありますが、アプリは前後の空白を取り除いて使います。
+- Console では「セキュリティ > Secret Manager > シークレットを作成」で作成します。
+
+### 11-e. 実行 SA に権限を付与する (プロジェクトのオーナーが実行)
+
+```powershell
+gcloud projects add-iam-policy-binding $P `
+  --member="serviceAccount:$RUNTIME" --role="roles/datastore.user" --condition=None
+
+foreach ($s in "gmail-refresh-token", "gmail-oauth-client-secret", "contact-ip-hash-key") {
+  gcloud secrets add-iam-policy-binding $s --project=$P `
+    --member="serviceAccount:$RUNTIME" --role="roles/secretmanager.secretAccessor"
+}
+```
+
+- Secret アクセサーは、プロジェクト全体ではなく **secret ごと**に付与します。
+- Firestore のセキュリティルール (すべて拒否) は、サーバーからのアクセス (IAM で制御) には適用されません。ルールは変更しません。
+- deployer に追加の権限は不要です。secret を Cloud Run の `--set-secrets` で渡すのではなく、アプリが実行時に Secret Manager から読むためです (`--set-secrets` の設定には Cloud Run 管理者のロールが必要と記載されています。[secrets](https://docs.cloud.google.com/run/docs/configuring/services/secrets))。
+
+### 11-f. 環境変数
+
+| 環境変数 | 値 | 備考 |
+| --- | --- | --- |
+| `CONTACT_NOTIFY_TO` | 通知を受け取るメールアドレス | 応答には含めない |
+| `GMAIL_OAUTH_CLIENT_ID` | 11-b のクライアント ID | |
+| `GMAIL_OAUTH_CLIENT_SECRET_SECRET_VERSION` | `projects/<PROJECT_ID>/secrets/gmail-oauth-client-secret/versions/latest` | |
+| `GMAIL_REFRESH_TOKEN_SECRET_VERSION` | `projects/<PROJECT_ID>/secrets/gmail-refresh-token/versions/latest` | |
+| `CONTACT_IP_HASH_KEY_SECRET_VERSION` | `projects/<PROJECT_ID>/secrets/contact-ip-hash-key/versions/latest` | |
+| `CONTACT_RATE_LIMIT_IP_PER_HOUR` / `CONTACT_RATE_LIMIT_IP_PER_DAY` / `CONTACT_RATE_LIMIT_SITE_PER_DAY` | 省略可 (既定 3 / 5 / 20) | |
+
+- `latest` を指定しているので、secret に新しいバージョンを追加すると、**新しく起動したインスタンス**から使われます (起動中のインスタンスは古い値を保持します)。
+- secret の値を環境変数に直接入れることもできます (`GMAIL_REFRESH_TOKEN` など。ローカル開発用)。ただし、Cloud Run の環境変数の値はサービスを閲覧できる人に見えるため、Cloud Run では Secret Manager を使ってください。
+- Cloud Run 上 (`K_SERVICE` がある場合) では、`X-Forwarded-For` の**最後の**値をクライアントの IP アドレスとして使います。クライアントが送った値は前に残り、最後の値は Cloud Run が付けるためです。
+
+```powershell
+$NOTIFY_TO = "<NOTIFY_TO_EMAIL>"
+$CLIENT_ID = "<CLIENT_ID>"
+```
+
+この 2 つを設定してから、8-b の deploy コマンドに `--update-env-vars` を付けて実行します。
+
+### 11-g. 確認
+
+```powershell
+$URL = "https://portfolio-<PROJECT_NUMBER>.$REGION.run.app"
+curl.exe -i -X POST "$URL/api/contact" -H "Content-Type: application/json" `
+  -d '{\"name\":\"Test\",\"email\":\"test@example.com\",\"message\":\"Hello\"}'
+# HTTP/1.1 202 Accepted ... {"status":"accepted"}
+```
+
+- 通知先にメールが届き、Firestore の `contacts` にドキュメントができていることを確認します。
+- 同じ IP アドレスから 1 時間に 4 回目を送ると、`429` (`Retry-After` 付き) になります。
+- `503` の場合は、Cloud Logging で `contact_failed` を確認してください (設定や権限の不足など)。`contact_notification_failed` は、保存はできたが通知に失敗したことを示します。
 
 ## 12. コスト防御と緊急停止
 
@@ -462,7 +632,8 @@ quota で費用の上限をかけられるかを確認した結果 (2026-10):
 
 ## 13. 注意事項
 
-- **`/api/contact` は、現時点では受信した内容をそのままログに出力します。** Issue #4 で保存と通知を実装するまでは、公開環境に実際の問い合わせ内容を送らないでください。
+- 問い合わせの内容はログに出力しません。ログに出るのは問い合わせ ID と、rate limit・失敗のイベント名だけです。
+- Gmail API は、quota を超えた分に課金することが 2026 年後半に予定されています (少なくとも 90 日前に告知)。問い合わせ API はサイト全体の上限 (既定 20 件/日) で送信数を抑えています。([quota](https://developers.google.com/workspace/gmail/api/reference/quota))
 - Docker Desktop で push するときは `--provenance=false --sbom=false` を付けてください (8-a を参照)。
 - 組織に属するプロジェクトでは、組織ポリシーが継承されます。`allUsers` への付与が禁止されている場合でも、`--no-invoker-iam-check` で公開できます。
 
