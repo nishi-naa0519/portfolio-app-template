@@ -9,6 +9,7 @@ React + TypeScript (Vite) のフロントエンドと FastAPI のバックエン
 ├── frontend/   # React + TypeScript + Vite
 ├── backend/    # FastAPI + Pydantic (uv で管理)
 ├── content/    # サイト固有コンテンツ (リポジトリには *.example.json のみ含める)
+├── docs/       # デプロイ手順などのドキュメント
 ├── Dockerfile  # frontend をビルドし、FastAPI から配信する単一イメージ
 └── .env.example
 ```
@@ -84,6 +85,13 @@ docker run --rm -p 8080:8080 portfolio-app
 
 - http://localhost:8080/ : frontend
 - http://localhost:8080/api/health : `{"status":"ok"}`
+
+## Cloud Run へのデプロイ
+
+Google Cloud の Cloud Run へ deploy する手順は [docs/deployment.md](docs/deployment.md) にまとめています。
+GCP プロジェクトの作成、Budget (通知のみ・Spend cap)、Service Account と権限、Artifact Registry、Firestore、Cloud Run の設定値とその理由、コスト防御と緊急停止の方法を扱います。
+
+> Budget Alert は課金を止める機能ではありません。料金の上限は、max instances、Spend cap、通知のみの Budget を組み合わせて抑えます。詳しくは手順書の「コスト防御と緊急停止」を参照してください。
 
 ## 検証コマンド
 
