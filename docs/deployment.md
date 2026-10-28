@@ -297,8 +297,13 @@ Console では「Artifact Registry > リポジトリ > リポジトリを作成�
 
 ### 8-a. build と push
 
+`docker build` がイメージにするのは、git の commit ではなく**作業フォルダにあるファイル**です。
+タグに commit ID を使うので、変更を commit し、`git status` で変更が残っていないことを確認してから実行してください (先に `$TAG` を取ると、タグと中身がずれます)。
+Docker Desktop が起動していないと、`failed to connect to the docker API` というエラーになります。
+
 ```powershell
-$TAG = git rev-parse --short HEAD
+git status                          # nothing to commit, working tree clean を確認
+$TAG = git rev-parse --short HEAD   # 今の commit ID の短縮形
 $IMAGE = "$REGION-docker.pkg.dev/$P/portfolio/portfolio:$TAG"
 
 # deployer の短命トークン (約1時間有効) で docker login する
@@ -530,9 +535,12 @@ cd ..
 - 無効にしただけのバージョンも「有効なバージョン」として数えられます。不要になった古いバージョンは `gcloud secrets versions destroy` で破棄してください。
 
 ```powershell
-# クライアント シークレット (貼り付けて Enter。画面には表示されない)
-Read-Host -AsSecureString "client secret" | ConvertFrom-SecureString -AsPlainText |
-  gcloud secrets create gmail-oauth-client-secret --project=$P --replication-policy=automatic --data-file=-
+# クライアント シークレット: Console でコピーしてから実行する (画面には表示されない)
+$plain = (Get-Clipboard | Out-String).Trim()
+$plain.Length; $plain.StartsWith("GOCSPX-")    # 35 前後と True になることを確認する
+$plain | gcloud secrets create gmail-oauth-client-secret --project=$P --replication-policy=automatic --data-file=-
+Remove-Variable plain
+Set-Clipboard -Value " "                        # クリップボードを上書きしておく
 
 # IP ハッシュ用の鍵 (32 バイトの乱数を 16 進数にしたもの)
 python -c "import secrets; print(secrets.token_hex(32))" |
@@ -542,6 +550,8 @@ gcloud secrets list --project=$P
 ```
 
 - パイプで渡すと末尾に改行が付くことがありますが、アプリは前後の空白を取り除いて使います。
+- `Read-Host -AsSecureString` の入力欄では、Ctrl+V で貼り付けられず制御文字が 1 文字だけ入ることがあります。上のようにクリップボードから直接渡すと確実です。Windows の「クリップボードの履歴」(Win+V) を使っている場合は、履歴からも削除してください。
+- 値を間違えて登録した場合は、`gcloud secrets versions add <SECRET_ID> --data-file=-` で正しい値を追加し、古いバージョンを `gcloud secrets versions destroy <VERSION> --secret=<SECRET_ID>` で破棄します。アプリは secret をインスタンスのメモリに保持するので、その後に deploy し直して新しいインスタンスで読み込ませます。
 - Console では「セキュリティ > Secret Manager > シークレットを作成」で作成します。
 
 ### 11-e. 実行 SA に権限を付与する (プロジェクトのオーナーが実行)
