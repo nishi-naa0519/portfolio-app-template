@@ -21,3 +21,7 @@ class ContactRequest(BaseModel):
 
 class ContactResponse(BaseModel):
     status: Literal["accepted"]
+
+
+class ErrorResponse(BaseModel):
+    detail: str

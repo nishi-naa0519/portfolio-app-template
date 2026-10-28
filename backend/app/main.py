@@ -7,10 +7,16 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.contact import router as contact_router
 from app.api.health import router as health_router
+from app.services.contact import ContactServiceProvider
 
 
-def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
+def create_app(
+    frontend_dist_dir: Path | None = None,
+    contact_service_provider: ContactServiceProvider | None = None,
+) -> FastAPI:
     app = FastAPI(title="Portfolio API")
+    # Built lazily on the first inquiry, so the app starts without GCP settings.
+    app.state.contact_service_provider = contact_service_provider or ContactServiceProvider()
     app.include_router(health_router, prefix="/api")
     app.include_router(contact_router, prefix="/api")
 

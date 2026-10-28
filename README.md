@@ -35,7 +35,7 @@ cp .env.example .env
 ```sh
 cd backend
 uv sync
-uv run uvicorn app.main:app --reload --port 8000
+uv run --env-file ../.env uvicorn app.main:app --reload --port 8000
 ```
 
 動作確認:
@@ -45,12 +45,16 @@ curl http://localhost:8000/api/health
 # {"status":"ok"}
 ```
 
-お問い合わせ API (現時点では保存・通知は行わず、受信内容を構造化ログへ出力するのみ):
+### お問い合わせ API (`POST /api/contact`)
+
+受け付けた問い合わせを Firestore に保存し、Gmail API でサイト所有者へ通知します。
+
+```text
+React (フォーム) → FastAPI → Firestore (保存 + rate limit) → Gmail API (通知)
+```
 
 ```sh
-curl -X POST http://localhost:8000/api/contact \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Example User","email":"user@example.com","message":"Hello"}'
+curl -X POST http://localhost:8000/api/contact   -H 'Content-Type: application/json'   -d '{"name":"Example User","email":"user@example.com","message":"Hello"}'
 # {"status":"accepted"}  (HTTP 202)
 ```
 
@@ -61,7 +65,28 @@ curl -X POST http://localhost:8000/api/contact \
 | `message` | 必須、1〜5000 文字 |
 | `website` | 任意。honeypot 用 (フォームでは非表示にする)。値があれば受理したように見せて破棄 |
 
-不正なリクエストや未知のフィールドには `422` を返します。
+| status | 意味 |
+| --- | --- |
+| `202` | 受理 (保存済み)。Gmail 通知に失敗した場合も、保存できていれば 202 を返します (再送による重複を防ぐため。失敗はログに記録) |
+| `422` | 入力値が不正、または未知のフィールドがある |
+| `429` | rate limit を超過。`Retry-After` ヘッダーに再試行までの秒数 |
+| `503` | 設定の不足、Firestore の障害など。内部の詳細は返しません |
+
+**Abuse 対策** (値は環境変数で変更できます。`.env.example` を参照):
+
+| 制限 | 既定値 | 環境変数 |
+| --- | --- | --- |
+| 同一 IP (IPv6 は /64 単位) | 3 件 / 時、5 件 / 日 | `CONTACT_RATE_LIMIT_IP_PER_HOUR`、`CONTACT_RATE_LIMIT_IP_PER_DAY` |
+| サイト全体 | 20 件 / 日 (= Gmail 送信の上限) | `CONTACT_RATE_LIMIT_SITE_PER_DAY` |
+
+- 時間の区切りは UTC の「時」「日」です (固定ウィンドウ)。受理した問い合わせだけを数え、超過したリクエストでは何も書き込みません。
+- rate limit 用のデータ (`contact_rate_limits` コレクション) には、IP アドレスを秘密鍵付きハッシュ (HMAC-SHA256) にした値と件数だけを保存します。期限 (`expire_at`) を過ぎたものは Firestore の TTL で削除されます。
+- 問い合わせ (`contacts` コレクション) には `name`・`email`・`message`・`created_at`・`status` (`unread`) だけを保存し、IP アドレスは保存しません。
+- 問い合わせの内容はログに出力しません (ログには問い合わせ ID だけを出します)。
+
+**ローカルで実際に保存・通知まで動かす場合**は、`.env` に Firestore のプロジェクトと Gmail の認証情報を設定し、`gcloud auth application-default login` で Application Default Credentials を用意してください。
+設定がない場合も backend は起動しますが、`/api/contact` は `503` を返します。
+GCP 側の準備 (OAuth クライアント、refresh token、Secret Manager、IAM、TTL) は [docs/deployment.md](docs/deployment.md) の「11. お問い合わせ機能 (Firestore・Gmail・Secret Manager)」を参照してください。
 
 ### 3. Frontend (http://localhost:5173)
 
@@ -75,6 +100,7 @@ npm run dev
 
 Vite の dev server は `/api` へのリクエストを `BACKEND_URL` (デフォルト `http://localhost:8000`) へ proxy します。
 画面に `Backend status: ok` と表示されれば frontend から backend へ接続できています。
+画面下部の Contact フォームから、お問い合わせ API を呼び出せます。
 
 ## Docker で起動
 
