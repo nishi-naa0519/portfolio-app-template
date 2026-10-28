@@ -10,7 +10,13 @@ from app.config import (
     RateLimits,
 )
 from app.models.contact import ContactRequest
-from app.services.rate_limit import Counter, build_counters, check_counters
+from app.services.rate_limit import (
+    Counter,
+    ExceededCounterCache,
+    RateLimitExceeded,
+    build_counters,
+    check_counters,
+)
 
 # Contention is unlikely at this traffic level; keep retries (and their reads) low.
 TRANSACTION_MAX_ATTEMPTS = 3
@@ -31,27 +37,34 @@ class FirestoreContactStore:
     def __init__(self, client: firestore.Client, limits: RateLimits) -> None:
         self._client = client
         self._limits = limits
+        self._exceeded = ExceededCounterCache()
 
     def save(self, contact: ContactRequest, ip_hash: str, now: datetime) -> str:
         """Check and increment the rate-limit counters and save the inquiry atomically.
 
-        Raises RateLimitExceeded without writing anything when a limit is reached.
+        Raises RateLimitExceeded without writing anything when a limit is reached, and
+        without reading anything when the limit was already reached in this window.
         """
         counters = build_counters(ip_hash, now, self._limits)
+        self._exceeded.check(counters, now)
         counter_refs = [
             self._client.collection(RATE_LIMITS_COLLECTION).document(c.doc_id) for c in counters
         ]
         contact_ref = self._client.collection(CONTACTS_COLLECTION).document()
 
         transactional = firestore.transactional(write_contact)
-        transactional(
-            self._client.transaction(max_attempts=TRANSACTION_MAX_ATTEMPTS),
-            counter_refs,
-            counters,
-            contact_ref,
-            contact_document(contact, now),
-            now,
-        )
+        try:
+            transactional(
+                self._client.transaction(max_attempts=TRANSACTION_MAX_ATTEMPTS),
+                counter_refs,
+                counters,
+                contact_ref,
+                contact_document(contact, now),
+                now,
+            )
+        except RateLimitExceeded as exc:
+            self._exceeded.add([c for c in counters if c.scope in exc.scopes], now)
+            raise
         return contact_ref.id
 
 

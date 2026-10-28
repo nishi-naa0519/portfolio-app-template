@@ -28,4 +28,6 @@ RUN useradd --create-home appuser
 USER appuser
 
 EXPOSE 8080
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+# Cloud Run already writes a request log for every request, so uvicorn's access log
+# would only double the Cloud Logging volume.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --no-access-log"]

@@ -68,6 +68,7 @@ curl -X POST http://localhost:8000/api/contact   -H 'Content-Type: application/j
 | status | 意味 |
 | --- | --- |
 | `202` | 受理 (保存済み)。Gmail 通知に失敗した場合も、保存できていれば 202 を返します (再送による重複を防ぐため。失敗はログに記録) |
+| `413` | リクエストの body が 32 KiB を超えている |
 | `422` | 入力値が不正、または未知のフィールドがある |
 | `429` | rate limit を超過。`Retry-After` ヘッダーに再試行までの秒数 |
 | `503` | 設定の不足、Firestore の障害など。内部の詳細は返しません |
@@ -83,6 +84,7 @@ curl -X POST http://localhost:8000/api/contact   -H 'Content-Type: application/j
 - rate limit 用のデータ (`contact_rate_limits` コレクション) には、IP アドレスを秘密鍵付きハッシュ (HMAC-SHA256) にした値と件数だけを保存します。期限 (`expire_at`) を過ぎたものは Firestore の TTL で削除されます。
 - 問い合わせ (`contacts` コレクション) には `name`・`email`・`message`・`created_at`・`status` (`unread`) だけを保存し、IP アドレスは保存しません。
 - 問い合わせの内容はログに出力しません (ログには問い合わせ ID だけを出します)。
+- 上限に達したカウンタはインスタンスのメモリに記憶し、同じ時間枠の間は Firestore を読まずに `429` を返します。
 
 **ローカルで実際に保存・通知まで動かす場合**は、`.env` に Firestore のプロジェクトと Gmail の認証情報を設定し、`gcloud auth application-default login` で Application Default Credentials を用意してください。
 設定がない場合も backend は起動しますが、`/api/contact` は `503` を返します。
@@ -118,6 +120,8 @@ Google Cloud の Cloud Run へ deploy する手順は [docs/deployment.md](docs/
 GCP プロジェクトの作成、Budget (通知のみ・Spend cap)、Service Account と権限、Artifact Registry、Firestore、Cloud Run の設定値とその理由、コスト防御と緊急停止の方法を扱います。
 
 > Budget Alert は課金を止める機能ではありません。料金の上限は、max instances、Spend cap、通知のみの Budget を組み合わせて抑えます。詳しくは手順書の「コスト防御と緊急停止」を参照してください。
+
+何を守るためにどの制限を設定しているか (Cloud Run の設定値の理由、Firestore の操作数、問い合わせ API の多層の制限、Gmail の送信数など) は [docs/cost-defense.md](docs/cost-defense.md) にまとめています。
 
 ## 検証コマンド
 

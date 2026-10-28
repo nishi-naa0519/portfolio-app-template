@@ -359,6 +359,9 @@ gcloud run services update portfolio --project=$P --region=$REGION --no-invoker-
 curl.exe "https://portfolio-<PROJECT_NUMBER>.$REGION.run.app/api/health"
 # {"status":"ok"}
 
+curl.exe -o NUL -w "%{http_code}" "https://portfolio-<PROJECT_NUMBER>.$REGION.run.app/openapi.json"
+# 404 (API ドキュメントは Cloud Run 上では無効)
+
 gcloud run services describe portfolio --project=$P --region=$REGION
 ```
 
@@ -387,8 +390,8 @@ Console では、「Cloud Run > portfolio」の「スケーリング」タブ (�
 | CPU | 1 | 1 未満にすると、concurrency = 1 などが強制され、静的ファイルの配信まで直列になる | 🔁 |
 | Memory | 512 MiB | 既定値。この規模のアプリには十分 | 🔁 |
 | 課金方式 | リクエストベース (`--cpu-throttling`) | リクエストの処理中・起動中・終了処理中だけ課金される。インスタンスベースは待機中も課金される | 🔁 |
-| Concurrency | 20 | max = 1 なので、値はコストに影響しない。512 MiB の1台を過負荷から守るため、既定の 80 より控えめにした | 🔁 |
-| Timeout | 15 秒 | 既定は 300 秒。異常に長いリクエストで課金時間が延びるのを防ぐ | 🔁 |
+| Concurrency | 20 | max = 1 なので、値はコストに影響しない。512 MiB の1台を過負荷から守るため、既定の 80 より控えめにした (詳しくは [cost-defense.md](cost-defense.md) の 3.) | 🔁 |
+| Timeout | 15 秒 | 既定は 300 秒。異常に長いリクエストで課金時間が延びるのを防ぐ (詳しくは [cost-defense.md](cost-defense.md) の 3.) | 🔁 |
 | 起動時 CPU ブースト | 無効 (`--no-cpu-boost`) | 新しいサービスでは既定で有効。ブースト中は追加の CPU 分も課金され、アクセスの少ないサイトではコールドスタートのたびに追加課金になる | 🔁 |
 | 認証 | 公開 (`--no-invoker-iam-check`) | 公開 Web サイトのため | 🔁 |
 | 実行 SA | `portfolio-runtime` | 最小権限のため。Compute Engine のデフォルト SA を避ける | 🔁 |
@@ -438,7 +441,7 @@ gcloud firestore databases describe --database="(default)" --project=$P
 | `contact_rate_limits` | rate limit のカウンタ (`count`・`expire_at`)。ドキュメント ID に IP の HMAC ハッシュと時間枠を含む | `expire_at` を TTL で削除 |
 
 1 件の問い合わせを受理するときの操作は、読み取り 3 件・書き込み 4 件 (1 つのトランザクション) です。
-rate limit を超えたリクエストは読み取り 3 件だけで、書き込みはしません。
+rate limit を超えたリクエストは読み取り 3 件だけで、書き込みはしません。超えたカウンタはインスタンスのメモリに記憶し、同じ時間枠の間の後続のリクエストは Firestore を読まずに `429` にします。
 書き込みはサイト全体の上限 (既定 20 件/日) で抑えられるため、TTL による削除も 1 日あたり数十件以下です (TTL の削除料金は 10 万件あたり $0.01 前後。2026-10 時点の us-central1)。
 
 **TTL ポリシー** (rate limit 用のデータを無期限に溜めないため。プロジェクトのオーナーが実行)
@@ -452,6 +455,23 @@ gcloud firestore fields ttls list --project=$P   # state: ACTIVE になれば OK
 
 - TTL による削除は、通常は期限切れから 24 時間以内に行われます。期限切れのデータが残っていても、時間枠ごとに別のドキュメントを使うので rate limit の判定には影響しません。([ttl](https://docs.cloud.google.com/firestore/docs/ttl))
 - Console では「Firestore > (default) > TTL」から、コレクション グループ `contact_rate_limits`、フィールド `expire_at` で作成します。
+
+**インデックスの除外** (検索に使わないフィールドのインデックスを作らないため。プロジェクトのオーナーが実行)
+
+```powershell
+gcloud firestore indexes fields update message --project=$P `
+  --collection-group=contacts --disable-indexes
+gcloud firestore indexes fields update expire_at --project=$P `
+  --collection-group=contact_rate_limits --disable-indexes
+gcloud firestore indexes fields update count --project=$P `
+  --collection-group=contact_rate_limits --disable-indexes
+
+gcloud firestore indexes fields list --project=$P   # 3 つのフィールドが表示されれば OK
+```
+
+- アプリはドキュメント ID で読み書きするだけで、クエリを使わないため、除外しても動作は変わりません。TTL は、インデックスのないフィールドでも動作します。
+- 理由は [cost-defense.md](cost-defense.md) の「4. Firestore」を参照してください。
+- Console では「Firestore > (default) > インデックス > 単一フィールド > 除外を追加」から設定します (コレクション ID とフィールドを指定し、すべてのインデックスを無効にする)。
 
 ## 11. お問い合わせ機能 (Firestore・Gmail・Secret Manager)
 
@@ -603,11 +623,12 @@ curl.exe -i -X POST "$URL/api/contact" -H "Content-Type: application/json" `
 
 - 通知先にメールが届き、Firestore の `contacts` にドキュメントができていることを確認します。
 - 同じ IP アドレスから 1 時間に 4 回目を送ると、`429` (`Retry-After` 付き) になります。
-- `503` の場合は、Cloud Logging で `contact_failed` を確認してください (設定や権限の不足など)。`contact_notification_failed` は、保存はできたが通知に失敗したことを示します。
+- `503` の場合は、Cloud Logging で `contact_failed` を確認してください (設定や権限の不足など)。設定の読み込みに失敗した後の 60 秒間は、再試行せずに `503` を返し、`contact_unavailable` を記録します。`contact_notification_failed` は、保存はできたが通知に失敗したことを示します。
 
 ## 12. コスト防御と緊急停止
 
 **どの設定も、単独では料金の上限を保証しません。** 複数の仕組みを組み合わせます。
+アプリ側の制限 (rate limit、body サイズの上限など) を含めた全体は、[cost-defense.md](cost-defense.md) にまとめています。
 
 | 仕組み | 守るもの | 限界 |
 | --- | --- | --- |
