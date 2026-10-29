@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -15,6 +16,9 @@ from app.config import RateLimits
 
 # IPv6 clients usually control a whole /64, so addresses are grouped by that prefix.
 IPV6_PREFIX_LENGTH = 64
+
+# Bounds the memory used by ExceededCounterCache (one short string and a datetime each).
+EXCEEDED_CACHE_MAX_ENTRIES = 1000
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,42 @@ def check_counters(counters: list[Counter], counts: list[int], now: datetime) ->
     """Raise RateLimitExceeded if accepting one more request would exceed any limit."""
     exceeded = [c for c, count in zip(counters, counts, strict=True) if count >= c.limit]
     if exceeded:
-        latest_reset = max(c.expires_at for c in exceeded)
-        retry_after = max(1, math.ceil((latest_reset - now).total_seconds()))
-        raise RateLimitExceeded([c.scope for c in exceeded], retry_after)
+        raise _exceeded_error(exceeded, now)
+
+
+def _exceeded_error(exceeded: list[Counter], now: datetime) -> RateLimitExceeded:
+    latest_reset = max(c.expires_at for c in exceeded)
+    retry_after = max(1, math.ceil((latest_reset - now).total_seconds()))
+    return RateLimitExceeded([c.scope for c in exceeded], retry_after)
+
+
+class ExceededCounterCache:
+    """Remembers counters that reached their limit until their window ends.
+
+    A counter only grows within its window, so later requests in the same window can be
+    rejected without reading Firestore again. The cache lives in one instance's memory;
+    losing it (e.g. a new instance) only means the counters are read once more.
+    """
+
+    def __init__(self, max_entries: int = EXCEEDED_CACHE_MAX_ENTRIES) -> None:
+        self._max_entries = max_entries
+        self._expires_at: dict[str, datetime] = {}
+        self._lock = threading.Lock()
+
+    def check(self, counters: list[Counter], now: datetime) -> None:
+        """Raise RateLimitExceeded if any counter is known to be full."""
+        # Document IDs include the window, so an entry never matches a later window.
+        with self._lock:
+            exceeded = [c for c in counters if c.doc_id in self._expires_at]
+        if exceeded:
+            raise _exceeded_error(exceeded, now)
+
+    def add(self, counters: list[Counter], now: datetime) -> None:
+        with self._lock:
+            if len(self._expires_at) + len(counters) > self._max_entries:
+                self._expires_at = {k: v for k, v in self._expires_at.items() if v > now}
+            for counter in counters:
+                while len(self._expires_at) >= self._max_entries:
+                    # Drop the oldest entry; it costs at most one more Firestore read.
+                    del self._expires_at[next(iter(self._expires_at))]
+                self._expires_at[counter.doc_id] = counter.expires_at

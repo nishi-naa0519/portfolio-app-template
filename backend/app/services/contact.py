@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,6 +12,14 @@ from app.models.contact import ContactRequest
 from app.services.rate_limit import hash_client_ip
 
 logger = logging.getLogger(__name__)
+
+# After a failed build (e.g. a wrong secret name), wait this long before trying again so
+# that every request does not repeat the Secret Manager calls.
+BUILD_RETRY_INTERVAL_SECONDS = 60.0
+
+
+class ContactServiceUnavailable(Exception):
+    """The service could not be built recently; the build is not retried yet."""
 
 
 class ContactStore(Protocol):
@@ -75,15 +84,34 @@ def build_contact_service() -> ContactService:
 
 
 class ContactServiceProvider:
-    """Builds the service on first use and reuses it; a failed build is retried next time."""
+    """Builds the service on first use and reuses it.
 
-    def __init__(self, build: Callable[[], ContactService] = build_contact_service) -> None:
+    A failed build is retried at most once per BUILD_RETRY_INTERVAL_SECONDS; in between,
+    get() raises ContactServiceUnavailable without calling any external service.
+    """
+
+    def __init__(
+        self,
+        build: Callable[[], ContactService] = build_contact_service,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._build = build
+        self._monotonic = monotonic
         self._service: ContactService | None = None
+        self._failed_at: float | None = None
         self._lock = threading.Lock()
 
     def get(self) -> ContactService:
         with self._lock:
             if self._service is None:
-                self._service = self._build()
+                if (
+                    self._failed_at is not None
+                    and self._monotonic() - self._failed_at < BUILD_RETRY_INTERVAL_SECONDS
+                ):
+                    raise ContactServiceUnavailable()
+                try:
+                    self._service = self._build()
+                except Exception:
+                    self._failed_at = self._monotonic()
+                    raise
             return self._service

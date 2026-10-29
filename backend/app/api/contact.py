@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, Response
 
 from app.models.contact import ContactRequest, ContactResponse, ErrorResponse
 from app.services.client_ip import get_client_ip
-from app.services.contact import ContactServiceProvider
+from app.services.contact import ContactServiceProvider, ContactServiceUnavailable
 from app.services.rate_limit import RateLimitExceeded
 
 router = APIRouter()
@@ -41,6 +41,13 @@ def post_contact(contact: ContactRequest, request: Request) -> ContactResponse |
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={"detail": RATE_LIMITED_DETAIL},
             headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+    except ContactServiceUnavailable:
+        # The cause was already logged with a stack trace when the build failed.
+        logger.warning(json.dumps({"event": "contact_unavailable"}))
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": UNAVAILABLE_DETAIL},
         )
     except Exception:
         # Details stay in the server log; the client only gets a generic message.

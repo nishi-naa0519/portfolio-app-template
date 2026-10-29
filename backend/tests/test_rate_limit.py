@@ -5,6 +5,7 @@ import pytest
 from app.config import RateLimits
 from app.services.contact_store import write_contact
 from app.services.rate_limit import (
+    ExceededCounterCache,
     RateLimitExceeded,
     build_counters,
     check_counters,
@@ -97,3 +98,51 @@ def test_write_contact_writes_nothing_when_limited() -> None:
         write_contact(transaction, refs, counters, FakeRef("contacts", "c1"), {"x": 1}, NOW)
 
     assert transaction.write_count == 0
+
+
+def test_exceeded_cache_rejects_known_full_counters_until_their_window_ends() -> None:
+    cache = ExceededCounterCache()
+    counters = build_counters("h", NOW, RateLimits())
+    cache.check(counters, NOW)
+
+    cache.add([counters[0]], NOW)
+
+    with pytest.raises(RateLimitExceeded) as exc_info:
+        cache.check(counters, NOW)
+    assert exc_info.value.scopes == ["ip_hour"]
+    assert exc_info.value.retry_after_seconds == 55 * 60 + 55
+    # Another client, and the same client in the next hour, use other counters.
+    cache.check(build_counters("other", NOW, RateLimits()), NOW)
+    next_hour = NOW.replace(hour=4, minute=0, second=0)
+    cache.check(build_counters("h", next_hour, RateLimits()), next_hour)
+
+
+def test_exceeded_cache_keeps_its_size_bounded() -> None:
+    cache = ExceededCounterCache(max_entries=2)
+    a, b, c = (build_counters(ip, NOW, RateLimits())[0] for ip in ("a", "b", "c"))
+
+    cache.add([a], NOW)
+    cache.add([b], NOW)
+    cache.add([c], NOW)
+
+    # The oldest entry was dropped; the newer ones are still known.
+    cache.check([a], NOW)
+    for counter in (b, c):
+        with pytest.raises(RateLimitExceeded):
+            cache.check([counter], NOW)
+
+
+def test_exceeded_cache_drops_expired_entries_first() -> None:
+    cache = ExceededCounterCache(max_entries=2)
+    old = build_counters("a", NOW, RateLimits())[0]
+    later = NOW.replace(hour=5)
+    current = build_counters("b", later, RateLimits())[0]
+    newest = build_counters("c", later, RateLimits())[0]
+
+    cache.add([old], NOW)
+    cache.add([current], later)
+    cache.add([newest], later)
+
+    for counter in (current, newest):
+        with pytest.raises(RateLimitExceeded):
+            cache.check([counter], later)

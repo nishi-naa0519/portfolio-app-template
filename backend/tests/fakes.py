@@ -7,7 +7,7 @@ from typing import Any
 from app.config import CONTACTS_COLLECTION, RATE_LIMITS_COLLECTION, RateLimits
 from app.models.contact import ContactRequest
 from app.services.contact_store import contact_document, write_contact
-from app.services.rate_limit import build_counters
+from app.services.rate_limit import ExceededCounterCache, RateLimitExceeded, build_counters
 
 Documents = dict[tuple[str, str], dict[str, Any]]
 
@@ -62,15 +62,26 @@ class InMemoryContactStore:
         self.docs: Documents = {}
         self.limits = limits or RateLimits()
         self.error: Exception | None = None
+        self.exceeded = ExceededCounterCache()
+        self.read_count = 0
 
     def save(self, contact: ContactRequest, ip_hash: str, now: datetime) -> str:
         if self.error is not None:
             raise self.error
         counters = build_counters(ip_hash, now, self.limits)
+        self.exceeded.check(counters, now)
         refs = [FakeRef(RATE_LIMITS_COLLECTION, c.doc_id) for c in counters]
         contact_ref = FakeRef(CONTACTS_COLLECTION, f"contact-{len(self.contacts()) + 1}")
         transaction = FakeTransaction(self.docs)
-        write_contact(transaction, refs, counters, contact_ref, contact_document(contact, now), now)
+        try:
+            write_contact(
+                transaction, refs, counters, contact_ref, contact_document(contact, now), now
+            )
+        except RateLimitExceeded as exc:
+            self.exceeded.add([c for c in counters if c.scope in exc.scopes], now)
+            raise
+        finally:
+            self.read_count += transaction.read_count
         transaction.commit()
         return contact_ref.id
 

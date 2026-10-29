@@ -7,14 +7,20 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.contact import router as contact_router
 from app.api.health import router as health_router
+from app.body_size_limit import BodySizeLimitMiddleware
 from app.services.contact import ContactServiceProvider
 
 
 def create_app(
     frontend_dist_dir: Path | None = None,
     contact_service_provider: ContactServiceProvider | None = None,
+    enable_api_docs: bool = True,
 ) -> FastAPI:
-    app = FastAPI(title="Portfolio API")
+    if enable_api_docs:
+        app = FastAPI(title="Portfolio API")
+    else:
+        app = FastAPI(title="Portfolio API", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(BodySizeLimitMiddleware)
     # Built lazily on the first inquiry, so the app starts without GCP settings.
     app.state.contact_service_provider = contact_service_provider or ContactServiceProvider()
     app.include_router(health_router, prefix="/api")
@@ -32,4 +38,8 @@ def create_app(
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
 
 _frontend_dist_env = os.getenv("FRONTEND_DIST_DIR")
-app = create_app(Path(_frontend_dist_env) if _frontend_dist_env else None)
+app = create_app(
+    Path(_frontend_dist_env) if _frontend_dist_env else None,
+    # The interactive API docs are only for development; Cloud Run sets K_SERVICE.
+    enable_api_docs=os.getenv("K_SERVICE") is None,
+)

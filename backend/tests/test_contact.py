@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 from app.config import RateLimits
 from app.main import create_app
 from app.models.contact import EMAIL_MAX_LENGTH, MESSAGE_MAX_LENGTH, NAME_MAX_LENGTH
-from app.services.contact import ContactService, ContactServiceProvider
+from app.services.contact import (
+    BUILD_RETRY_INTERVAL_SECONDS,
+    ContactService,
+    ContactServiceProvider,
+)
 from tests.fakes import FakeClock, FakeNotifier, InMemoryContactStore
 
 VALID_PAYLOAD = {
@@ -236,6 +240,35 @@ def test_rejected_requests_do_not_count_or_write(ctx: Context) -> None:
     assert ctx.store.docs == before
 
 
+def test_requests_over_a_reached_limit_do_not_read_firestore(ctx: Context) -> None:
+    for _ in range(3):
+        post(ctx)
+    assert post(ctx).status_code == 429
+    reads = ctx.store.read_count
+
+    responses = [post(ctx) for _ in range(5)]
+
+    assert [r.status_code for r in responses] == [429] * 5
+    assert ctx.store.read_count == reads
+    assert all(r.headers["Retry-After"] == responses[0].headers["Retry-After"] for r in responses)
+
+
+def test_requests_after_the_site_limit_do_not_read_firestore_from_any_ip() -> None:
+    ctx = make_context(trust_x_forwarded_for=True, limits=RateLimits(site_per_day=2))
+    for i in range(3):
+        post(ctx, headers={"X-Forwarded-For": f"192.0.2.{i}"})
+    reads = ctx.store.read_count
+
+    response = post(ctx, headers={"X-Forwarded-For": "198.51.100.1"})
+
+    assert response.status_code == 429
+    assert ctx.store.read_count == reads
+
+    # The next day has its own counter, so the cached limit no longer applies.
+    ctx.clock.now += timedelta(days=1)
+    assert post(ctx, headers={"X-Forwarded-For": "198.51.100.1"}).status_code == 202
+
+
 def test_rate_limit_documents_expire_and_do_not_store_raw_ip() -> None:
     ctx = make_context(trust_x_forwarded_for=True)
 
@@ -286,8 +319,12 @@ def test_store_failure_returns_503_without_details(
     assert contact_logs(caplog) == [{"event": "contact_failed"}]
 
 
-def test_configuration_failure_returns_503_and_is_retried() -> None:
+def test_configuration_failure_returns_503_and_is_retried_after_an_interval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
     attempts: list[int] = []
+    now = [100.0]
 
     def build() -> ContactService:
         attempts.append(1)
@@ -295,16 +332,27 @@ def test_configuration_failure_returns_503_and_is_retried() -> None:
             raise RuntimeError("GMAIL_REFRESH_TOKEN is not set")
         return make_context().service
 
-    client = TestClient(create_app(contact_service_provider=ContactServiceProvider(build)))
+    provider = ContactServiceProvider(build, monotonic=lambda: now[0])
+    client = TestClient(create_app(contact_service_provider=provider))
 
     first = client.post("/api/contact", json=VALID_PAYLOAD)
+    now[0] += BUILD_RETRY_INTERVAL_SECONDS - 1
     second = client.post("/api/contact", json=VALID_PAYLOAD)
+    now[0] += 1
+    third = client.post("/api/contact", json=VALID_PAYLOAD)
 
     assert first.status_code == 503
     assert first.json() == UNAVAILABLE
     assert "GMAIL" not in first.text
-    assert second.status_code == 202
+    # Within the interval the build (and its Secret Manager calls) is not repeated.
+    assert second.status_code == 503
+    assert second.json() == UNAVAILABLE
+    assert third.status_code == 202
     assert len(attempts) == 2
+    assert contact_logs(caplog)[:2] == [
+        {"event": "contact_failed"},
+        {"event": "contact_unavailable"},
+    ]
 
 
 def test_notification_failure_still_accepts_saved_inquiry(
